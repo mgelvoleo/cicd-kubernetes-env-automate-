@@ -1,0 +1,76 @@
+---
+- name: Install Kubernetes (kubeadm, kubelet, kubectl) on k8s nodes
+  hosts: kubernetes
+  become: yes
+  tasks:
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Kubernetes signing key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key
+        dest: /tmp/kubernetes-release.key
+
+    - name: Convert key to gpg format
+      command: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes-release.key
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold kubelet, kubeadm, kubectl at current version
+      command: apt-mark hold kubelet kubeadm kubectl
+
+    - name: Enable IP forwarding permanently
+      lineinfile:
+        path: /etc/sysctl.conf
+        regexp: '^net.ipv4.ip_forward'
+        line: 'net.ipv4.ip_forward=1'
+        state: present
+
+    - name: Apply sysctl changes
+      command: sysctl -p
+
+- name: Initialize Kubernetes cluster (master only)
+  hosts: master
+  become: yes
+  tasks:
+    - name: Initialize kubeadm with Flannel pod network
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16
+      args:
+        creates: /etc/kubernetes/admin.conf
+    
+    - name: Create .kube directory for vagrant user
+      become_user: vagrant
+      file:
+        path: /home/vagrant/.kube
+        state: directory
+        mode: '0755'
+
+    - name: Copy admin.conf to vagrant's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/vagrant/.kube/config
+        remote_src: yes
+        owner: vagrant
+        group: vagrant
+        mode: '0644'

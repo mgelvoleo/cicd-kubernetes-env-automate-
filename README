@@ -1,0 +1,228 @@
+# 🧩 Setup a Multinode Kubernetes Cluster using Kubeadm and Vagrant
+
+This guide will help you **create a Kubernetes cluster with one master and two worker nodes** using **Vagrant + VirtualBox + kubeadm**.  
+It includes Ansible automation for updating packages and streamlines the setup from zero to a working Kubernetes cluster.
+
+---
+
+## ⚙️ Prerequisites
+
+- **Vagrant** installed → [https://developer.hashicorp.com/vagrant/downloads](https://developer.hashicorp.com/vagrant/downloads)
+- **VirtualBox** installed → [https://www.virtualbox.org/wiki/Downloads](https://www.virtualbox.org/wiki/Downloads)
+- Minimum system requirements:
+  - 8 GB RAM
+  - 4 CPU cores
+  - 40 GB free disk space
+
+---
+
+## 🏗️ Step 1: Deploy the Vagrant Environment
+
+Create a `Vagrantfile` with the following content:
+
+```ruby
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+  config.ssh.insert_key = false
+
+  # Controller node
+  config.vm.define "cicd" do |cicd|
+    cicd.vm.hostname = "controller"
+    cicd.vm.network "private_network", ip: "192.168.56.10"
+    cicd.vm.provider "virtualbox" do |vb|
+      vb.name = "controller"
+      vb.memory = 2048
+      vb.cpus = 2
+    end
+
+    cicd.vm.provision "shell", inline: <<-SHELL
+      # Generate SSH key for controller if not exists
+      if [ ! -f /home/vagrant/.ssh/id_rsa ]; then
+        ssh-keygen -t rsa -b 4096 -N "" -f /home/vagrant/.ssh/id_rsa
+        chown vagrant:vagrant /home/vagrant/.ssh/id_rsa*
+      fi
+
+      # Add host entries
+      echo "192.168.56.11 master"  | sudo tee -a /etc/hosts
+      echo "192.168.56.12 worker1" | sudo tee -a /etc/hosts
+      echo "192.168.56.13 worker2" | sudo tee -a /etc/hosts
+    SHELL
+  end
+
+  # Function to add controller's pubkey to other nodes
+  def add_pubkey(node, hostname, ip)
+    node.vm.hostname = hostname
+    node.vm.network "private_network", ip: ip
+    node.vm.provider "virtualbox" do |vb|
+      vb.name = "k8s-#{hostname}"
+      vb.memory = 2048
+      vb.cpus = 2
+    end
+
+    node.vm.provision "shell", inline: <<-SHELL
+      mkdir -p /home/vagrant/.ssh
+      chmod 700 /home/vagrant/.ssh
+      # Copy controller's public key (shared via /vagrant folder)
+      if [ -f /vagrant/id_rsa.pub ]; then
+        cat /vagrant/id_rsa.pub >> /home/vagrant/.ssh/authorized_keys
+        chmod 600 /home/vagrant/.ssh/authorized_keys
+        chown -R vagrant:vagrant /home/vagrant/.ssh
+      fi
+    SHELL
+  end
+
+  # Master node
+  config.vm.define "master" do |master|
+    add_pubkey(master, "master", "192.168.56.11")
+    master.vm.provider "virtualbox" do |vb|
+      vb.memory = 3072
+    end
+  end
+
+  # Worker1
+  config.vm.define "worker1" do |worker|
+    add_pubkey(worker, "worker1", "192.168.56.12")
+  end
+
+  # Worker2
+  config.vm.define "worker2" do |worker|
+    add_pubkey(worker, "worker2", "192.168.56.13")
+  end
+end
+
+```
+
+
+
+**Then run:**
+
+`vagrant up`
+
+This will spin up 4 VMs:
+
+- `controller` — for managing setup and Ansible
+    
+- `master` — Kubernetes control plane
+    
+- `worker1` and `worker2` — Kubernetes worker nodes
+    
+
+---
+
+## 🔐 Step 2: Verify SSH Connectivity
+
+From the `controller` node, SSH into all other nodes:
+
+`vagrant ssh controller ssh vagrant@192.168.56.11 ssh vagrant@192.168.56.12 ssh vagrant@192.168.56.13`
+
+If all connections succeed without a password, SSH access is configured correctly.
+
+---
+
+## ⚡ Step 3: Install Ansible on Controller
+
+`sudo apt update && sudo apt upgrade -y sudo apt install -y software-properties-common sudo add-apt-repository --yes --update ppa:ansible/ansible sudo apt install -y ansible ansible --version`
+
+Create an Ansible workspace:
+
+`mkdir -p /vagrant/ansible && cd /vagrant/ansible`
+
+---
+
+## 🔁 Step 4: Create Ansible Playbook to Update All Nodes
+
+Create a playbook file `update.yml`:
+
+`--- - name: Update all nodes   hosts: all   become: true   tasks:     - name: Update apt cache       apt:         update_cache: yes         cache_valid_time: 3600      - name: Upgrade all packages       apt:         upgrade: dist         autoremove: yes         autoclean: yes`
+
+Then run:
+
+`ansible-playbook -i inventory update.yml`
+
+---
+
+## ☸️ Step 5: Install Kubernetes on Master Node
+
+SSH into the master node:
+
+`vagrant ssh master`
+
+Then perform these steps:
+
+### 1️⃣ Disable Swap
+
+`sudo swapoff -a sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab`
+
+### 2️⃣ Enable Kernel Modules and Sysctl
+
+`cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf overlay br_netfilter EOF  sudo modprobe overlay sudo modprobe br_netfilter  cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf net.bridge.bridge-nf-call-iptables  = 1 net.bridge.bridge-nf-call-ip6tables = 1 net.ipv4.ip_forward                 = 1 EOF  sudo sysctl --system`
+
+### 3️⃣ Install Container Runtime (Containerd)
+
+`curl -LO https://github.com/containerd/containerd/releases/download/v1.7.14/containerd-1.7.14-linux-amd64.tar.gz sudo tar Cxzvf /usr/local containerd-1.7.14-linux-amd64.tar.gz curl -LO https://raw.githubusercontent.com/containerd/containerd/main/containerd.service sudo mkdir -p /usr/local/lib/systemd/system/ sudo mv containerd.service /usr/local/lib/systemd/system/ sudo mkdir -p /etc/containerd containerd config default | sudo tee /etc/containerd/config.toml sudo sed -i 's/SystemdCgroup \= false/SystemdCgroup \= true/g' /etc/containerd/config.toml sudo systemctl daemon-reload sudo systemctl enable --now containerd`
+
+### 4️⃣ Install Runc and CNI Plugins
+
+`curl -LO https://github.com/opencontainers/runc/releases/download/v1.1.12/runc.amd64 sudo install -m 755 runc.amd64 /usr/local/sbin/runc  curl -LO https://github.com/containernetworking/plugins/releases/download/v1.5.0/cni-plugins-linux-amd64-v1.5.0.tgz sudo mkdir -p /opt/cni/bin sudo tar Cxzvf /opt/cni/bin cni-plugins-linux-amd64-v1.5.0.tgz`
+
+### 5️⃣ Install kubeadm, kubelet, kubectl
+
+`sudo apt-get update sudo apt-get install -y apt-transport-https ca-certificates curl gpg  curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list  sudo apt-get update sudo apt-get install -y kubelet=1.29.6-1.1 kubeadm=1.29.6-1.1 kubectl=1.29.6-1.1 --allow-downgrades --allow-change-held-packages sudo apt-mark hold kubelet kubeadm kubectl`
+
+### 6️⃣ Configure crictl
+
+`sudo crictl config runtime-endpoint unix:///var/run/containerd/containerd.sock`
+
+### 7️⃣ Initialize Control Plane
+
+`sudo kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=192.168.56.11 --node-name master`
+
+> 📋 Copy the **kubeadm join command** displayed at the end — you’ll need it for worker nodes.
+
+### 8️⃣ Configure kubectl
+
+`mkdir -p $HOME/.kube sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config sudo chown $(id -u):$(id -g) $HOME/.kube/config`
+
+### 9️⃣ Install Calico Network Plugin
+
+`kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml curl -O https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/custom-resources.yaml kubectl apply -f custom-resources.yaml`
+
+---
+
+## 🧩 Step 6: Configure Worker Nodes
+
+SSH into each worker node (`worker1`, `worker2`) and perform steps **1 to 8** from the Master setup (system config + runtime + kube tools).
+
+Then **join the cluster** using the command generated earlier, for example:
+
+`sudo kubeadm join 192.168.56.11:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>`
+
+If you forgot the join command, run this on the master:
+
+`kubeadm token create --print-join-command`
+
+---
+
+## ✅ Step 7: Verify Cluster Connection
+
+On the master node:
+
+`kubectl get nodes`
+
+Expected output:
+
+`NAME       STATUS   ROLES           AGE     VERSION master     Ready    control-plane   10m     v1.29.6 worker1    Ready    <none>          3m      v1.29.6 worker2    Ready    <none>          2m      v1.29.6`
+
+You now have a **working Kubernetes multinode cluster** running locally!
+
+---
+
+## 🧠 Summary
+
+|Node|Role|IP|Memory|
+|---|---|---|---|
+|controller|Ansible / SSH Hub|192.168.56.10|2 GB|
+|master|Control Plane|192.168.56.11|3 GB|
+|worker1|Worker Node|192.168.56.12|2 GB|
+
+|worker2|Worker Node|192.168.56.13|2 GB|

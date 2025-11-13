@@ -1,0 +1,45 @@
+---
+- name: Install and configure containerd on Kubernetes nodes
+  hosts: master,workers
+  become: true
+  tasks:
+    - name: Ensure required packages are installed
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate default containerd config
+      command: containerd config default
+      register: containerd_config
+      changed_when: false
+
+    - name: Write containerd config file
+      copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_config.stdout }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: true
