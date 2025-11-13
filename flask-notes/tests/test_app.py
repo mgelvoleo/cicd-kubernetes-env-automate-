@@ -8,7 +8,7 @@ class FlaskAppTest(unittest.TestCase):
     def test_home(self):
         res = self.client.get('/')
         self.assertEqual(res.status_code, 200)
-        self.assertIn(b"Welcome to Flask Notes API!", res.data)
+        self.assertIn(b"Welcome to the Notes APP!", res.data)
 
 if __name__ == '__main__':
     unittest.main()
